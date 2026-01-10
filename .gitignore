@@ -1,0 +1,20 @@
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# IDE
+.vscode/
+.idea/
+
+# Secrets
+include/secrets.h
+
+# Nix
+result
+.direnv/
+
+# Build artifacts
+*.o
+*.elf
+*.bin
