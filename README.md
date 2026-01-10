@@ -78,7 +78,7 @@ Without transceivers, we use a single shared wire with diodes on each TXD line a
         └───────┘                         └──────┘
         Meter MCU                         ESP32-S3
 
-        ->|-  = 1N4148 or similar small signal diode (cathode to bus)
+        ->|-  = 1N4148 or similar small signal diode (cathode to micro)
 ```
 
 The diodes allow any node to pull the bus low (dominant) while the 3.3kΩ pull-up holds it high (recessive) when idle.
@@ -89,17 +89,17 @@ The diodes allow any node to pull the bus low (dominant) while the 3.3kΩ pull-u
 
 ### Wiring
 
-| Meter (10x2) | Signal | Connection | Notes |
-|--------------|--------|------------|-------|
-| Top-3 (TXD) | Meter TX | Diode → Bus | Cathode to shared bus wire |
-| Top-4 (RXD) | Meter RX | Bus direct | Shared bus wire |
-| Bottom-1 | GND | GND | Common ground |
+| Meter (10x2) | Signal   | Connection  | Notes            |
+|--------------|----------|-------------|------------------|
+| Top-3 (TXD)  | Meter TX | Diode → Bus | Cathode to micro |
+| Top-4 (RXD)  | Meter RX | Bus direct  | Shared bus wire  |
+| Bottom-1     | GND      | GND         | Common ground    |
 
-| ESP32-S3 | Signal | Connection | Notes |
-|----------|--------|------------|-------|
-| GPIO1 (D0) | ESP32 TX | Diode → Bus | Cathode to shared bus wire |
-| GPIO2 (D1) | ESP32 RX | Bus direct | Shared bus wire |
-| GND | GND | GND | Common ground |
+| ESP32-S3   | Signal   | Connection  | Notes            |
+|------------|----------|-------------|------------------|
+| GPIO1 (D0) | ESP32 TX | Diode → Bus | Cathode to micro |
+| GPIO2 (D1) | ESP32 RX | Bus direct  | Shared bus wire  |
+| GND        | GND      | GND         | Common ground    |
 
 | Bus     | Component     | Notes                         |
 |---------|---------------|-------------------------------|
@@ -133,8 +133,8 @@ The ESP32 fits inside the meter enclosure. Route wires to avoid high-voltage are
 │  │  10x2   │               │   ESP32-S3   │    │
 │  │ (no CAN │               │              │    │
 │  │  xcvr)  │      bus      │              │    │
-│  │   TXD ──┼─┬─|◄──┬──►|─┬─┼── D0 (GPIO1) │    │
-│  │   RXD ──┼─┘     │     └─┼── D1 (GPIO2) │    │
+│  │   TXD ──┼──|◄─┬─┬─┬─►|──┼── D0 (GPIO1) │    │
+│  │   RXD ──┼─────┘ │ └─────┼── D1 (GPIO2) │    │
 │  └─────────┘       │       │              │    │
 │  ┌─────────┐     [3k3]     │              │    │
 │  │  10x1   │       └───────┼── 3V3        │    │
