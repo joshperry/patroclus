@@ -2,7 +2,9 @@
 
 Wirelessifying a VE.CAN energy meter.
 
-Tap the internal CAN bus and 5V of a Victron MV-3P75CT 3-phase meter with an ESP32 and publishes measurements to Venus OS via MQTT. This code would work as well with an external VE.CAN connection if a transceiver is added to the ESP32 and it was powered separately.
+Tap the internal CAN bus and very convenient mains-powered 5V of a Victron MV-3P75CT 3-phase mains power meter with an ESP32 and publish the measurements as one or more virtual meters to Venus OS via MQTT.
+
+This code would work as well with an external VE.CAN connection if a transceiver is added to the ESP32 and it's powered separately.
 
 ## Status
 
@@ -30,11 +32,11 @@ Tap the internal CAN bus and 5V of a Victron MV-3P75CT 3-phase meter with an ESP
 
 ### Modification Overview
 
-The MV-3P75CT has a **TCAN1042V** CAN transceiver on a daughterboard that plugs into the main PCB via a 10x2 connector. We **remove the transceiver** and wire the ESP32's TWAI peripheral directly to the meter MCU's CAN TX/RX lines. This gives us a 3.3V logic-level connection without needing our own transceiver.
+The MV-3P75CT has a **TCAN1042V** CAN transceiver on an IO daughterboard that connects into the base PCB at 90deg. We **remove the transceiver** and wire the ESP32's TWAI peripheral directly to the meter MCU's CAN TX/RX lines. This gives us a 3.3V logic-level connection without needing our own transceiver.
 
 ### 10x2 Daughterboard Connector
 
-The transceiver daughterboard is soldered into the base board with a 10x2 90-deg pin header and has the CAN tx and rx lines from the micro:
+The IO daughterboard is soldered into the base board with a 10x2 90-deg pin header and carries the CAN tx and rx lines from the micro:
 
 ```
 Viewed on top of IO board
@@ -54,7 +56,7 @@ Viewed on top of IO board
 Just above the 10x2 connection on the base PCB is an **unpopulated 10x1 header**. This provides a convenient power tap:
 
 ```
-Viewed from the I/O side:
+Viewed from the I/O side of the base board:
 
         1   2   3   4   5   6   7   8   9  10
       ┌───┬───┬───┬───┬───┬───┬───┬───┬───┬───┐
