@@ -107,7 +107,7 @@ The diodes allow any node to pull the bus low (dominant) while the 3.3kΩ pull-u
 
 | Meter (10x1) | Signal | ESP32-S3 Pin | Notes |
 |--------------|--------|--------------|-------|
-| Pin 1 | 5V | 5V | Power input (also for pull-up) |
+| Pin 1 | 5V | 5V | Power input |
 | Pin 4 | GND | GND | Common ground |
 
 ### Power Options
