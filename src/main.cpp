@@ -1,7 +1,7 @@
 /*
  * Patroclus - VE.CAN Energy Meter Reader for Victron GX
  * 
- * Taps internal CAN bus of Precision Circuits MV-3P75CT 3-phase meter,
+ * Taps internal CAN bus of Victron MV-3P75CT 3-phase meter,
  * decodes per-phase measurements, and publishes to Victron GX as
  * virtual grid meters via dbus-mqtt-devices driver.
  * 
@@ -10,6 +10,8 @@
  * - HTTP OTA for remote firmware updates (POST to /update)
  * - MQTT command interface for remote control
  * - Remote CAN capture streaming
+ * - Energy accumulation (kWh) from meter registers
+ * - Per-phase power factor
  * 
  * Hardware: Seeed Studio XIAO ESP32-S3
  * 
@@ -42,7 +44,7 @@ struct PhaseMeasurement {
     float voltage;          // V AC
     float current;          // A
     float power;            // W (real power, negative = import)
-    float energyForward;    // kWh (bought/consumed)
+    float energyForward;    // kWh (bought/consumed) - per phase if available
     float energyReverse;    // kWh (sold/exported)
     float powerFactor;      // 0.0 - 1.0
     unsigned long lastUpdate;   // millis() of last CAN update
@@ -51,8 +53,9 @@ struct PhaseMeasurement {
 
 // Physical meter data (3 phases from MV-3P75CT)
 struct MeterData {
-    float frequency;        // Hz (common to all phases)
-    PhaseMeasurement phases[3];  // Physical L1, L2, L3
+    float frequency;            // Hz (common to all phases)
+    float totalEnergyForward;   // kWh (total from meter register 0x50)
+    PhaseMeasurement phases[3]; // Physical L1, L2, L3
 };
 
 // Virtual meter configuration (published to Venus OS)
@@ -163,6 +166,23 @@ int captureCount = 0;
 // OTA state
 bool otaInProgress = false;
 
+#if ENABLE_GENSET_HANDOFF
+// Generator handoff state. We watch any Venus genset's /StatusCode and, while it's
+// running, move the transfer-switched inlet meter's readings onto the genset's AC
+// paths while zeroing its grid meter (see config.h). All state resets per connection.
+int  gensetInstance   = -1;       // genset instance we're tracking (-1 = none yet)
+bool gensetRunning    = false;    // last seen StatusCode == GENSET_RUNNING_STATUSCODE
+bool gensetAcCapable  = false;    // genset advertises writable Ac/* paths (else can't hand off)
+bool gensetHandoffActive = false; // currently routing inlet -> genset + zeroing grid
+bool gensetSubscribed = false;    // subscribed to N/<portal>/genset/... this connection
+bool gensetFirstKa    = true;     // next keepalive is the connection's first
+unsigned long gensetKaCount = 0;  // keepalives sent (gates periodic full republish)
+unsigned long lastGensetKa = 0;
+String topicGensetStatus;         // N/<portal>/genset/+/StatusCode
+String topicGensetAc;             // N/<portal>/genset/+/Ac/#
+String topicGensetKeepalive;      // R/<portal>/keepalive
+#endif
+
 // ============================================================================
 // MQTT Topics
 // ============================================================================
@@ -190,6 +210,7 @@ String topicStatus;     // device/patroclus/Status - registration
 // Forward declarations
 void publishLog(const char* message);
 void publishLog(const String& message);
+void publishVirtualMeter(int meterIndex, bool forceZero = false);
 
 // ============================================================================
 // LED Status Functions
@@ -411,7 +432,36 @@ void processCanFrame(const twai_message_t& msg) {
         memcpy(cap.data, msg.data, 8);
     }
 
-    // Parse 19F30xxx VE.CAN energy meter messages
+    unsigned long now = millis();
+    
+    // Handle register-based messages (0x19EFFF40)
+    // Format: [seq_lo][seq_hi][register][sub_seq][value 32-bit LE]
+    if (msg.identifier == CAN_ID_REGISTER) {
+        uint8_t reg = msg.data[2];
+        uint32_t regVal = (uint32_t)msg.data[4] | 
+                          ((uint32_t)msg.data[5] << 8) | 
+                          ((uint32_t)msg.data[6] << 16) | 
+                          ((uint32_t)msg.data[7] << 24);
+        
+        switch (reg) {
+            case REG_ENERGY_FORWARD:
+                // Energy in Wh, convert to kWh
+                meterData.totalEnergyForward = regVal / 1000.0f;
+                break;
+            //case REG_L1_PF:
+            //    meterData.phases[0].powerFactor = regVal / 1000.0f;
+            //    break;
+            //case REG_L2_PF:
+            //    meterData.phases[1].powerFactor = regVal / 1000.0f;
+            //    break;
+            //case REG_L3_PF:
+            //    meterData.phases[2].powerFactor = regVal / 1000.0f;
+            //    break;
+        }
+        return;  // Don't fall through to 0x19F30xxx parsing
+    }
+
+    // Parse 0x19F30xxx VE.CAN energy meter messages
     // Format: [seq_lo][seq_hi][val1_lo][val1_hi][val2_b0][val2_b1][val2_b2][val2_b3]
     
     uint16_t val16 = (msg.data[3] << 8) | msg.data[2];
@@ -419,8 +469,6 @@ void processCanFrame(const twai_message_t& msg) {
                     ((int32_t)msg.data[5] << 8) | 
                     ((int32_t)msg.data[6] << 16) | 
                     ((int32_t)msg.data[7] << 24);
-    
-    unsigned long now = millis();
     
     switch (msg.identifier) {
         // L1 Voltage/Frequency
@@ -586,6 +634,180 @@ void publishLog(const String& message) {
 }
 
 // ============================================================================
+// Generator Handoff
+// ============================================================================
+
+#if ENABLE_GENSET_HANDOFF
+
+// Parse "N/<portalId>/genset/<inst>/<rest>". Returns the instance and points
+// *restOut at the remainder ("StatusCode", "Ac/L1/Power", ...); -1 if not a genset
+// topic for our portal.
+int parseGensetTopic(const char* topic, const char** restOut) {
+    if (portalId[0] == '\0') return -1;
+    char prefix[48];
+    int plen = snprintf(prefix, sizeof(prefix), "N/%s/genset/", portalId);
+    if (plen <= 0 || strncmp(topic, prefix, plen) != 0) return -1;
+    const char* p = topic + plen;           // "<inst>/<rest>"
+    const char* slash = strchr(p, '/');
+    if (!slash || slash == p) return -1;
+    *restOut = slash + 1;
+    return atoi(p);
+}
+
+// Digest an inbound genset N/ message: track run state and AC-path capability.
+void handleGensetMessage(int inst, const char* rest, const char* payload) {
+    if (GENSET_INSTANCE >= 0 && inst != GENSET_INSTANCE) return;   // not the one we follow
+
+    if (strcmp(rest, "StatusCode") == 0) {
+        JsonDocument doc;
+        if (deserializeJson(doc, payload)) return;
+        if (doc["value"].isNull()) return;
+        int sc = doc["value"].as<int>();
+        gensetInstance = inst;
+        bool run = (sc == GENSET_RUNNING_STATUSCODE);
+        if (run != gensetRunning) {
+            gensetRunning = run;
+            DEBUG_PRINTF("Genset %d StatusCode=%d -> %s\n", inst, sc, run ? "RUNNING" : "stopped");
+        }
+    } else if (strncmp(rest, "Ac/", 3) == 0) {
+        // The path existing on N/ (even null) means it's declared & writable. A genset
+        // without AC paths never publishes these, so we never become capable -> we
+        // safely leave the inlet meter on grid rather than dropping its power.
+        gensetInstance = inst;
+        if (!gensetAcCapable) {
+            gensetAcCapable = true;
+            DEBUG_PRINTF("Genset %d advertises writable AC paths\n", inst);
+        }
+    }
+}
+
+// Write one genset dbus path directly (W/<portal>/genset/<inst>/<leaf>). Patroclus
+// isn't the genset's registrant, so we can't use the freakent Proxy channel - but raw
+// W/ writes go straight through the flashmq dbus bridge (same path the GX uses).
+void writeGensetPath(const char* leaf, float value) {
+    char topic[96];
+    snprintf(topic, sizeof(topic), "W/%s/genset/%d/%s", portalId, gensetInstance, leaf);
+    char payload[48];
+    snprintf(payload, sizeof(payload), "{\"value\":%.2f}", value);
+    mqttClient.publish(topic, payload);
+}
+
+// Publish the inlet meter's phases onto the genset's AC paths (or zero them). Phase
+// mapping mirrors the handoff meter's grid mapping, so the genset reports exactly what
+// the inlet sees while the generator is the live source.
+void publishGensetAc(bool zero) {
+    if (gensetInstance < 0 || portalId[0] == '\0') return;
+    VirtualMeterConfig const& meter = virtualMeters[GENSET_HANDOFF_METER];
+    const char* legs[] = {"Ac/L1", "Ac/L2", "Ac/L3"};
+    float totalPower = 0;
+    char leaf[32];
+    for (int v = 0; v < 3; v++) {
+        int phys = meter.physicalPhase[v];
+        if (phys < 0 || phys >= 3) continue;
+        PhaseMeasurement& d = meterData.phases[phys];
+        float volt = zero ? 0 : d.voltage;
+        float curr = zero ? 0 : d.current;
+        float powr = zero ? 0 : d.power;
+        snprintf(leaf, sizeof(leaf), "%s/Voltage", legs[v]); writeGensetPath(leaf, volt);
+        snprintf(leaf, sizeof(leaf), "%s/Current", legs[v]); writeGensetPath(leaf, curr);
+        snprintf(leaf, sizeof(leaf), "%s/Power",   legs[v]); writeGensetPath(leaf, powr);
+        totalPower += powr;
+    }
+    writeGensetPath("Ac/Power",     totalPower);
+    writeGensetPath("Ac/Frequency", zero ? 0 : meterData.frequency);
+}
+
+// Zero the handoff meter's grid service via DIRECT W/ writes (using its registration
+// topicPath, e.g. W/<portal>/grid/<inst>). Used on the handoff ON edge: the per-cycle
+// Proxy zero travels freakent's slower proxy path and lands ~0.7s after the genset's
+// direct W/ write, briefly showing the inlet on both services (systemcalc sums them).
+// Writing the grid zero on the same direct bridge makes both land together.
+void writeGridZero() {
+    VirtualMeterState& state = meterStates[GENSET_HANDOFF_METER];
+    if (!state.registered || state.topicPath[0] == '\0') return;
+    VirtualMeterConfig const& meter = virtualMeters[GENSET_HANDOFF_METER];
+    const char* legs[]   = {"Ac/L1", "Ac/L2", "Ac/L3"};
+    const char* leaves[] = {"Voltage", "Current", "Power"};
+    char topic[96];
+    const char* zeroBody = "{\"value\":0}";
+    for (int v = 0; v < 3; v++) {
+        int phys = meter.physicalPhase[v];
+        if (phys < 0 || phys >= 3) continue;
+        for (int k = 0; k < 3; k++) {
+            snprintf(topic, sizeof(topic), "%s/%s/%s", state.topicPath, legs[v], leaves[k]);
+            mqttClient.publish(topic, zeroBody);
+        }
+    }
+    snprintf(topic, sizeof(topic), "%s/Ac/Power", state.topicPath);
+    mqttClient.publish(topic, zeroBody);
+    snprintf(topic, sizeof(topic), "%s/Ac/Frequency", state.topicPath);
+    mqttClient.publish(topic, zeroBody);
+}
+
+// Recompute whether we should be handing off, and act on the transition edges.
+void updateGensetHandoff() {
+    // One-shot notice if a generator is running but we can't move its power to it.
+    static bool warnedNoAc = false;
+    if (gensetRunning && gensetInstance >= 0 && !gensetAcCapable) {
+        if (!warnedNoAc) {
+            warnedNoAc = true;
+            publishLog("Genset running but exposes no writable AC paths; inlet meter stays on grid");
+        }
+    } else if (!gensetRunning) {
+        warnedNoAc = false;
+    }
+
+    bool want = (gensetInstance >= 0) && gensetRunning && gensetAcCapable;
+    if (want == gensetHandoffActive) return;
+
+    gensetHandoffActive = want;
+    lastPublishTime = 0;    // force an immediate publish of the new routing
+    if (want) {
+        publishLog("Genset handoff ON: inlet meter -> genset, grid zeroed");
+        // Zero the grid on the edge via the fast direct-W/ path (symmetric with the OFF
+        // edge zeroing the genset below), so we never briefly report the inlet on BOTH
+        // services. The genset's real readings follow on the forced publish next loop.
+        writeGridZero();
+    } else {
+        publishLog("Genset handoff OFF: inlet meter -> grid");
+        publishGensetAc(true);  // clear the genset AC so it doesn't hold stale power
+    }
+}
+
+// Subscribe to genset topics once the portal is known, and run the keepalive that
+// keeps the GX pushing N/ genset changes to us (it stops after ~60s of silence).
+void gensetMaintenance() {
+    if (!mqttClient.connected() || portalId[0] == '\0') return;
+
+    if (!gensetSubscribed) {
+        topicGensetStatus    = String("N/") + portalId + "/genset/+/StatusCode";
+        topicGensetAc        = String("N/") + portalId + "/genset/+/Ac/#";
+        topicGensetKeepalive = String("R/") + portalId + "/keepalive";
+        mqttClient.subscribe(topicGensetStatus.c_str());
+        mqttClient.subscribe(topicGensetAc.c_str());
+        gensetSubscribed = true;
+        gensetFirstKa = true;
+        gensetKaCount = 0;
+        lastGensetKa = 0;
+        DEBUG_PRINTLN("Genset handoff: subscribed, watching for a genset");
+    }
+
+    unsigned long now = millis();
+    if (gensetFirstKa || now - lastGensetKa >= GENSET_KEEPALIVE_MS) {
+        lastGensetKa = now;
+        // Every Nth keepalive (incl. the first) triggers a full republish so we learn
+        // a genset that appeared late + its AC capability; the rest just hold the session.
+        bool republish = (gensetKaCount % GENSET_REPUBLISH_EVERY) == 0;
+        const char* payload = republish ? "" : "{\"keepalive-options\":[\"suppress-republish\"]}";
+        mqttClient.publish(topicGensetKeepalive.c_str(), payload);
+        gensetKaCount++;
+        gensetFirstKa = false;
+    }
+}
+
+#endif // ENABLE_GENSET_HANDOFF
+
+// ============================================================================
 // MQTT Command Handler
 // ============================================================================
 
@@ -604,6 +826,7 @@ void handleCommand(const char* cmd) {
         response += "MQTT: " + String(mqttClient.connected() ? "Connected" : "Disconnected") + "\n";
         response += "OTA: http://" + WiFi.localIP().toString() + ":" + String(HTTP_OTA_PORT) + "/update\n";
         response += "Freq: " + String(meterData.frequency, 2) + " Hz\n";
+        response += "Total Energy: " + String(meterData.totalEnergyForward, 3) + " kWh\n";
         
         // Physical phases
         response += "\nPhysical Phases:\n";
@@ -614,6 +837,7 @@ void handleCommand(const char* cmd) {
             response += "V=" + String(data.voltage, 1);
             response += " I=" + String(data.current, 2);
             response += " P=" + String(data.power, 0);
+            response += " PF=" + String(data.powerFactor, 3);
             response += " (" + String(data.valid ? "ok" : "stale") + ")\n";
         }
         
@@ -742,7 +966,19 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         handleCommand(buffer);
         return;
     }
-    
+
+#if ENABLE_GENSET_HANDOFF
+    // Genset run-state / AC-capability updates (N/<portal>/genset/<inst>/...)
+    {
+        const char* rest;
+        int inst = parseGensetTopic(topic, &rest);
+        if (inst >= 0) {
+            handleGensetMessage(inst, rest, buffer);
+            return;
+        }
+    }
+#endif
+
     // Check if this is a DBus response
     if (String(topic) != topicDBus) {
         return;
@@ -831,6 +1067,16 @@ void clearRegistration() {
         meterStates[i].topicPath[0] = '\0';
         meterStates[i].deviceInstance = 0;
     }
+#if ENABLE_GENSET_HANDOFF
+    // Re-bind + re-learn the genset on the next connection (instances/AC capability
+    // are re-asserted by the republish after we re-subscribe).
+    gensetSubscribed = false;
+    gensetInstance = -1;
+    gensetRunning = false;
+    gensetAcCapable = false;
+    gensetHandoffActive = false;
+    gensetFirstKa = true;
+#endif
 }
 
 // ============================================================================
@@ -846,83 +1092,103 @@ bool isPhaseValid(int physicalPhase) {
     return age <= CAN_TIMEOUT_MS;
 }
 
-// Publish a virtual meter with its mapped phases
-void publishVirtualMeter(int meterIndex) {
+// Publish a virtual meter with its mapped phases. When `forceZero` is set the meter
+// is published as dead (0 V/I/P, 0 Hz) regardless of CAN data and with no energy
+// keys - used to retire the grid meter while its inlet is handed off to the genset
+// (omitting energy freezes the cumulative register rather than crediting genset energy
+// to the grid meter).
+void publishVirtualMeter(int meterIndex, bool forceZero) {
     VirtualMeterConfig const& meter = virtualMeters[meterIndex];
     VirtualMeterState& state = meterStates[meterIndex];
-    
+
     if (!state.registered || state.topicPath[0] == '\0') {
         return;
     }
-    
-    // Check if at least one mapped phase has valid data
-    bool hasValidData = false;
-    for (int v = 0; v < 3; v++) {
-        if (isPhaseValid(meter.physicalPhase[v])) {
-            hasValidData = true;
-            break;
+
+    if (!forceZero) {
+        // Check if at least one mapped phase has valid data
+        bool hasValidData = false;
+        for (int v = 0; v < 3; v++) {
+            if (isPhaseValid(meter.physicalPhase[v])) {
+                hasValidData = true;
+                break;
+            }
         }
+        if (!hasValidData) return;
     }
-    if (!hasValidData) return;
-    
+
     JsonDocument doc;
     doc["topicPath"] = state.topicPath;
-    
+
     JsonObject values = doc["values"].to<JsonObject>();
-    
+
     // Metadata
     values["ProductId"] = 0xFFFF;
     values["CustomName"] = meter.name;
     values["DeviceType"] = meter.deviceType;
     values["ErrorCode"] = 0;
-    
+
     // Aggregates
     float totalPower = 0;
-    float totalEnergyFwd = 0;
     float totalEnergyRev = 0;
-    
+
     // Virtual phase labels
     const char* phasePaths[] = {"Ac/L1", "Ac/L2", "Ac/L3"};
-    
+
     // Map each virtual phase
     for (int v = 0; v < 3; v++) {
         int phys = meter.physicalPhase[v];
         if (phys < 0 || phys >= 3) continue;
-        
+
         PhaseMeasurement& data = meterData.phases[phys];
-        if (!isPhaseValid(phys)) continue;
-        
+
         String base = String(phasePaths[v]);
+        if (forceZero) {
+            values[base + "/Voltage"] = 0;
+            values[base + "/Current"] = 0;
+            values[base + "/Power"] = 0;
+            values[base + "/PowerFactor"] = 0;
+            continue;   // no energy keys -> cumulative register frozen
+        }
+        if (!isPhaseValid(phys)) continue;
+
         values[base + "/Voltage"] = data.voltage;
         values[base + "/Current"] = data.current;
         values[base + "/Power"] = data.power;
+        values[base + "/PowerFactor"] = data.powerFactor;
         values[base + "/Energy/Forward"] = data.energyForward;
         values[base + "/Energy/Reverse"] = data.energyReverse;
-        
+
         totalPower += data.power;
-        totalEnergyFwd += data.energyForward;
         totalEnergyRev += data.energyReverse;
     }
-    
+
     // Aggregates
-    values["Ac/Power"] = totalPower;
-    values["Ac/Energy/Forward"] = totalEnergyFwd;
-    values["Ac/Energy/Reverse"] = totalEnergyRev;
-    
-    // Frequency (shared)
-    values["Ac/Frequency"] = meterData.frequency;
-    
-    char payload[768];
+    values["Ac/Power"] = forceZero ? 0 : totalPower;
+    values["Ac/Frequency"] = forceZero ? 0 : meterData.frequency;
+    if (!forceZero) {
+        values["Ac/Energy/Forward"] = meterData.totalEnergyForward;
+        values["Ac/Energy/Reverse"] = totalEnergyRev;
+    }
+
+    char payload[1024];
     serializeJson(doc, payload, sizeof(payload));
-    
+
     char topic[64];
     snprintf(topic, sizeof(topic), "device/%s/Proxy", CLIENT_ID);
-    
+
     mqttClient.publish(topic, payload);
 }
 
 void publishAllMeters() {
     for (int i = 0; i < METER_COUNT; i++) {
+#if ENABLE_GENSET_HANDOFF
+        if (i == GENSET_HANDOFF_METER && gensetHandoffActive) {
+            publishGensetAc(false);         // inlet readings -> genset device
+            publishVirtualMeter(i, true);   // inlet grid meter -> zeroed
+            continue;
+        }
+#endif
         publishVirtualMeter(i);
     }
 }
@@ -1142,7 +1408,14 @@ void loop() {
     if (deviceState != STATE_RUNNING) {
         return;
     }
-    
+
+#if ENABLE_GENSET_HANDOFF
+    // Keep the genset subscription + keepalive alive and re-evaluate the handoff edge
+    // every loop (cheap; the publish itself is still rate-limited below).
+    gensetMaintenance();
+    updateGensetHandoff();
+#endif
+
     // Publish periodically
     if (now - lastPublishTime >= PUBLISH_INTERVAL_MS) {
         lastPublishTime = now;

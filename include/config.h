@@ -35,7 +35,7 @@
 // Device Identity
 // ============================================================================
 #define CLIENT_ID "patroclus01"
-#define DEVICE_VERSION "v0.4.0"
+#define DEVICE_VERSION "v0.6.2"
 
 // ============================================================================
 // HTTP OTA Configuration
@@ -66,17 +66,29 @@
 // CAN Message IDs - VE.CAN Energy Meter Format
 // ============================================================================
 // Source address 0x40, 29-bit extended IDs
-// Structure: [seq_lo][seq_hi][val1_lo][val1_hi][val2_b0][val2_b1][val2_b2][val2_b3]
 
-// Per-phase voltage/frequency (bytes 2-3 = V×10, bytes 6-7 = Hz×10)
+// Per-phase voltage/frequency messages (0x19F30xxx)
+// Format: [seq_lo][seq_hi][val1_lo][val1_hi][val2_b0][val2_b1][val2_b2][val2_b3]
+// val1 = Voltage × 10, val2 bytes 6-7 = Frequency × 10
 #define CAN_ID_L1_VOLTAGE    0x19F30340
 #define CAN_ID_L2_VOLTAGE    0x19F30440
 #define CAN_ID_L3_VOLTAGE    0x19F30540
 
-// Per-phase current/power (bytes 2-3 = I×10, bytes 4-7 = signed power in W)
+// Per-phase current/power messages (0x19F30xxx)
+// val1 = Current × 10, val2 = signed power in Watts
 #define CAN_ID_L1_POWER      0x19F30040
 #define CAN_ID_L2_POWER      0x19F30140
 #define CAN_ID_L3_POWER      0x19F30240
+
+// Register-based messages (0x19EFFF40)
+// Format: [seq_lo][seq_hi][register][sub_seq][value 32-bit LE]
+#define CAN_ID_REGISTER      0x1CEFFF40
+
+// EFFF Register addresses
+#define REG_ENERGY_FORWARD   0x50    // Total energy in Wh
+#define REG_L1_PF            0x55    // L1 Power Factor × 1000
+#define REG_L2_PF            0x5A    // L2 Power Factor × 1000
+#define REG_L3_PF            0x09    // L3 Power Factor × 1000
 
 // ============================================================================
 // Virtual Meter Configuration
@@ -112,9 +124,43 @@
 #define METER1_VIRT_L3_PHYS  -1   // Not used
 
 // ============================================================================
+// Generator Handoff (transfer-switched inlet meter -> genset output)
+// ============================================================================
+// When a generator runs, the AC transfer switch routes its output through the same
+// inlet a "grid" meter measures, so that meter now reads the GENERATOR's output.
+// Reporting it on BOTH the grid meter AND a genset service double-counts it in Venus
+// systemcalc (Consumption = grid + genset). With handoff enabled, while a generator
+// is running we move that meter's readings to the genset's AC paths and zero the grid
+// meter, so exactly one service reports the power.
+//
+// Deliberately GENERIC - watches any Venus genset's /StatusCode, no dependency on a
+// particular controller. Degrades safely: with no genset present, or a genset that
+// has no writable AC paths, the inlet meter just keeps reporting as grid (the power
+// is still counted once - never dropped).
+#ifndef ENABLE_GENSET_HANDOFF
+#define ENABLE_GENSET_HANDOFF 1
+#endif
+
+// Virtual-meter index that sits AFTER the transfer switch (the shared inlet).
+#define GENSET_HANDOFF_METER        0
+
+// Genset device instance to follow, or -1 to track whichever genset is running.
+#define GENSET_INSTANCE             -1
+
+// /StatusCode value meaning "running / producing AC" (Venus genset: 8 = Running).
+#define GENSET_RUNNING_STATUSCODE   8
+
+// Keepalive cadence that keeps the GX pushing N/ genset topics to us (< ~60s cutoff).
+#define GENSET_KEEPALIVE_MS         25000
+
+// Every Nth keepalive triggers a full republish (re-learn genset presence / AC
+// capability for a genset that appeared after we connected). First one always does.
+#define GENSET_REPUBLISH_EVERY      10
+
+// ============================================================================
 // Timing Configuration (milliseconds)
 // ============================================================================
-#define PUBLISH_INTERVAL_MS     1000        // Publish to MQTT every 1 second
+#define PUBLISH_INTERVAL_MS     500        // Publish to MQTT every 1 second
 #define HEARTBEAT_INTERVAL_MS   60000       // Keepalive every 60 seconds
 #define CAN_TIMEOUT_MS          5000        // No CAN data = stale
 
@@ -129,7 +175,7 @@
 
 // Remote CAN capture
 #define CAN_CAPTURE_BUFFER_SIZE     64      // Max frames to buffer for MQTT publish
-#define CAN_CAPTURE_INTERVAL_MS     1000    // Publish captured frames every N ms
+#define CAN_CAPTURE_INTERVAL_MS     100     // Publish captured frames every N ms
 
 // ============================================================================
 // Hardware Configuration (XIAO ESP32-S3)
