@@ -35,7 +35,7 @@
 // Device Identity
 // ============================================================================
 #define CLIENT_ID "patroclus01"
-#define DEVICE_VERSION "v0.6.2"
+#define DEVICE_VERSION "v0.6.3"
 
 // ============================================================================
 // HTTP OTA Configuration

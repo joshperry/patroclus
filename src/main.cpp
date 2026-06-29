@@ -927,8 +927,13 @@ bool mqttConnect() {
     
     String willPayload = buildLastWillPayload();
     
-    if (mqttClient.connect(CLIENT_ID, MQTT_USER, MQTT_PASS, 
-                           topicStatus.c_str(), 0, false, willPayload.c_str())) {
+    // willRetain = true: the registration is published retained (connected:1), so the
+    // disconnect will MUST also be retained (connected:0) to overwrite it. Otherwise the
+    // non-retained will only reaches live subscribers and the retained connected:1 lingers
+    // forever - freakent then keeps re-creating a ghost grid meter on every restart, and
+    // its frozen last value stays summed into the GX's AC Consumption (stuck AC load).
+    if (mqttClient.connect(CLIENT_ID, MQTT_USER, MQTT_PASS,
+                           topicStatus.c_str(), 0, true, willPayload.c_str())) {
         DEBUG_PRINTLN("MQTT connected");
         
         // Subscribe to DBus responses
