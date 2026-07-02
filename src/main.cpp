@@ -29,6 +29,8 @@
 #include <ESPmDNS.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include <GxSession.h>
+#include <GxClient.h>
 
 #if ENABLE_HTTP_OTA
 #include <WebServer.h>
@@ -67,19 +69,12 @@ struct VirtualMeterConfig {
     int physicalPhase[3];   // Map virtual L1/L2/L3 to physical phase index (-1 = unused)
 };
 
-// Virtual meter registration state
-struct VirtualMeterState {
-    bool registered;
-    char topicPath[64];     // W/portalId/grid/N path from registration
-    int deviceInstance;
-};
-
-// State machine states
+// State machine states (registration itself rides gxClient.connect(); WAIT polls
+// the async DBus binding)
 enum DeviceState {
     STATE_INIT,
     STATE_WIFI_CONNECT,
     STATE_MQTT_CONNECT,
-    STATE_REGISTER,
     STATE_WAIT_REGISTRATION,
     STATE_RUNNING
 };
@@ -124,6 +119,19 @@ const VirtualMeterConfig virtualMeters[METER_COUNT] = {
 #endif
 };
 
+// gx-projector-client service table: every virtual meter registers as dbus type
+// "grid" (as v1 did); the grid-vs-acload identity travels as DeviceType in the
+// registration init instead.
+const gx::ServiceDef gxServices[METER_COUNT] = {
+    { METER0_SERVICE_ID, "grid" },
+#if METER_COUNT > 1
+    { METER1_SERVICE_ID, "grid" },
+#endif
+#if METER_COUNT > 2
+    { METER2_SERVICE_ID, "grid" },
+#endif
+};
+
 // ============================================================================
 // Global State
 // ============================================================================
@@ -140,11 +148,14 @@ WebServer httpServer(HTTP_OTA_PORT);
 #endif
 
 MeterData meterData;                            // Physical phase data
-VirtualMeterState meterStates[METER_COUNT];     // Virtual meter states
 DeviceState deviceState = STATE_INIT;
 
-char portalId[32] = "";
-bool allMetersRegistered = false;
+// The gx-device-projector contract (registration/binding, online liveness, cookie
+// re-announce, Proxy relay) lives in the shared library; the session exposes the
+// portal id and per-meter W/ topic bases the genset handoff needs.
+gx::GxSession gxSession(CLIENT_ID, DEVICE_VERSION, gxServices, METER_COUNT);
+gx::GxClient gxClient(mqttClient, gxSession);
+
 IPAddress mqttServerIP;
 
 // Timing
@@ -187,11 +198,10 @@ String topicGensetKeepalive;      // R/<portal>/keepalive
 // MQTT Topics
 // ============================================================================
 
+// (Status/DBus/online/Proxy registration topics are owned by gxSession.)
 String topicCommand;    // device/patroclus/Command - incoming commands
 String topicLog;        // device/patroclus/Log - outgoing logs/responses
 String topicCapture;    // device/patroclus/Capture - CAN frame stream
-String topicDBus;       // device/patroclus/DBus - registration responses
-String topicStatus;     // device/patroclus/Status - registration
 
 // ============================================================================
 // Debug Logging
@@ -261,7 +271,6 @@ void updateLedStatus() {
         case STATE_MQTT_CONNECT:
             ledBlink(125);      // 4Hz - fast blink
             break;
-        case STATE_REGISTER:
         case STATE_WAIT_REGISTRATION:
             ledDoubleBlink();
             break;
@@ -643,9 +652,10 @@ void publishLog(const String& message) {
 // *restOut at the remainder ("StatusCode", "Ac/L1/Power", ...); -1 if not a genset
 // topic for our portal.
 int parseGensetTopic(const char* topic, const char** restOut) {
-    if (portalId[0] == '\0') return -1;
+    const char* portal = gxSession.portalId();
+    if (portal[0] == '\0') return -1;
     char prefix[48];
-    int plen = snprintf(prefix, sizeof(prefix), "N/%s/genset/", portalId);
+    int plen = snprintf(prefix, sizeof(prefix), "N/%s/genset/", portal);
     if (plen <= 0 || strncmp(topic, prefix, plen) != 0) return -1;
     const char* p = topic + plen;           // "<inst>/<rest>"
     const char* slash = strchr(p, '/');
@@ -686,7 +696,7 @@ void handleGensetMessage(int inst, const char* rest, const char* payload) {
 // W/ writes go straight through the flashmq dbus bridge (same path the GX uses).
 void writeGensetPath(const char* leaf, float value) {
     char topic[96];
-    snprintf(topic, sizeof(topic), "W/%s/genset/%d/%s", portalId, gensetInstance, leaf);
+    snprintf(topic, sizeof(topic), "W/%s/genset/%d/%s", gxSession.portalId(), gensetInstance, leaf);
     char payload[48];
     snprintf(payload, sizeof(payload), "{\"value\":%.2f}", value);
     mqttClient.publish(topic, payload);
@@ -696,7 +706,7 @@ void writeGensetPath(const char* leaf, float value) {
 // mapping mirrors the handoff meter's grid mapping, so the genset reports exactly what
 // the inlet sees while the generator is the live source.
 void publishGensetAc(bool zero) {
-    if (gensetInstance < 0 || portalId[0] == '\0') return;
+    if (gensetInstance < 0 || gxSession.portalId()[0] == '\0') return;
     VirtualMeterConfig const& meter = virtualMeters[GENSET_HANDOFF_METER];
     const char* legs[] = {"Ac/L1", "Ac/L2", "Ac/L3"};
     float totalPower = 0;
@@ -723,8 +733,8 @@ void publishGensetAc(bool zero) {
 // direct W/ write, briefly showing the inlet on both services (systemcalc sums them).
 // Writing the grid zero on the same direct bridge makes both land together.
 void writeGridZero() {
-    VirtualMeterState& state = meterStates[GENSET_HANDOFF_METER];
-    if (!state.registered || state.topicPath[0] == '\0') return;
+    const char* base = gxSession.topicW(virtualMeters[GENSET_HANDOFF_METER].serviceId);
+    if (base[0] == '\0') return;    // not bound
     VirtualMeterConfig const& meter = virtualMeters[GENSET_HANDOFF_METER];
     const char* legs[]   = {"Ac/L1", "Ac/L2", "Ac/L3"};
     const char* leaves[] = {"Voltage", "Current", "Power"};
@@ -734,13 +744,13 @@ void writeGridZero() {
         int phys = meter.physicalPhase[v];
         if (phys < 0 || phys >= 3) continue;
         for (int k = 0; k < 3; k++) {
-            snprintf(topic, sizeof(topic), "%s/%s/%s", state.topicPath, legs[v], leaves[k]);
+            snprintf(topic, sizeof(topic), "%s/%s/%s", base, legs[v], leaves[k]);
             mqttClient.publish(topic, zeroBody);
         }
     }
-    snprintf(topic, sizeof(topic), "%s/Ac/Power", state.topicPath);
+    snprintf(topic, sizeof(topic), "%s/Ac/Power", base);
     mqttClient.publish(topic, zeroBody);
-    snprintf(topic, sizeof(topic), "%s/Ac/Frequency", state.topicPath);
+    snprintf(topic, sizeof(topic), "%s/Ac/Frequency", base);
     mqttClient.publish(topic, zeroBody);
 }
 
@@ -777,12 +787,13 @@ void updateGensetHandoff() {
 // Subscribe to genset topics once the portal is known, and run the keepalive that
 // keeps the GX pushing N/ genset changes to us (it stops after ~60s of silence).
 void gensetMaintenance() {
-    if (!mqttClient.connected() || portalId[0] == '\0') return;
+    const char* portal = gxSession.portalId();
+    if (!mqttClient.connected() || portal[0] == '\0') return;
 
     if (!gensetSubscribed) {
-        topicGensetStatus    = String("N/") + portalId + "/genset/+/StatusCode";
-        topicGensetAc        = String("N/") + portalId + "/genset/+/Ac/#";
-        topicGensetKeepalive = String("R/") + portalId + "/keepalive";
+        topicGensetStatus    = String("N/") + portal + "/genset/+/StatusCode";
+        topicGensetAc        = String("N/") + portal + "/genset/+/Ac/#";
+        topicGensetKeepalive = String("R/") + portal + "/keepalive";
         mqttClient.subscribe(topicGensetStatus.c_str());
         mqttClient.subscribe(topicGensetAc.c_str());
         gensetSubscribed = true;
@@ -841,11 +852,13 @@ void handleCommand(const char* cmd) {
             response += " (" + String(data.valid ? "ok" : "stale") + ")\n";
         }
         
-        // Virtual meters
-        response += "\nVirtual Meters:\n";
+        // Virtual meters (the lib binds all-or-nothing)
+        response += "\nVirtual Meters (";
+        response += String(gxSession.bound() ? "registered" : "pending");
+        response += "):\n";
         for (int i = 0; i < METER_COUNT; i++) {
-            response += "  " + String(virtualMeters[i].name) + ": ";
-            response += String(meterStates[i].registered ? "registered" : "pending") + "\n";
+            response += "  " + String(virtualMeters[i].name) + " inst=";
+            response += String(gxSession.instance(virtualMeters[i].serviceId)) + "\n";
         }
         
         publishLog(response);
@@ -890,9 +903,7 @@ void mqttSetup() {
     topicCommand = String("device/") + CLIENT_ID + "/Command";
     topicLog = String("device/") + CLIENT_ID + "/Log";
     topicCapture = String("device/") + CLIENT_ID + "/Capture";
-    topicDBus = String("device/") + CLIENT_ID + "/DBus";
-    topicStatus = String("device/") + CLIENT_ID + "/Status";
-    
+
     #if MQTT_USE_TLS
     wifiClient.setInsecure();   // Skip cert verification for self-signed
     #endif
@@ -900,54 +911,50 @@ void mqttSetup() {
     mqttClient.setBufferSize(2048);  // Larger buffer for captures
 }
 
-String buildLastWillPayload() {
-    JsonDocument doc;
-    doc["clientId"] = CLIENT_ID;
-    doc["connected"] = 0;
-    doc["version"] = DEVICE_VERSION;
-    doc["services"].to<JsonObject>();
-    
-    String payload;
-    serializeJson(doc, payload);
-    return payload;
+// Board-authored initial values for one meter's registration init, rebuilt from
+// virtualMeters on every (re-)announce. Under v2 these seed the dbus paths once at
+// device build (freakent applies init only while the device isn't already online),
+// replacing the v1 habit of republishing static identity every Proxy cycle.
+void fillMeterInit(const char* tag, JsonObject init, void* ctx) {
+    (void)ctx;
+    for (int i = 0; i < METER_COUNT; i++) {
+        if (strcmp(virtualMeters[i].serviceId, tag) != 0) continue;
+        init["CustomName"] = virtualMeters[i].name;
+        init["DeviceType"] = virtualMeters[i].deviceType;
+        init["ProductId"] = 0xFFFF;
+        init["ErrorCode"] = 0;
+        return;
+    }
 }
 
 bool mqttConnect() {
     if (mqttClient.connected()) {
         return true;
     }
-    
+
     unsigned long now = millis();
     if (now - lastMQTTAttempt < MQTT_RECONNECT_DELAY_MS) {
         return false;
     }
     lastMQTTAttempt = now;
-    
+
     DEBUG_PRINTF("Connecting to MQTT: %s:%d\n", mqttServerIP.toString().c_str(), MQTT_PORT);
-    
-    String willPayload = buildLastWillPayload();
-    
-    // willRetain = true: the registration is published retained (connected:1), so the
-    // disconnect will MUST also be retained (connected:0) to overwrite it. Otherwise the
-    // non-retained will only reaches live subscribers and the retained connected:1 lingers
-    // forever - freakent then keeps re-creating a ghost grid meter on every restart, and
-    // its frozen last value stays summed into the GX's AC Consumption (stuck AC load).
-    if (mqttClient.connect(CLIENT_ID, MQTT_USER, MQTT_PASS,
-                           topicStatus.c_str(), 0, true, willPayload.c_str())) {
+
+    // The lib runs the whole contract prologue: CONNECT with will = RETAINED "0" on
+    // device/<id>/online (the ghost-meter fix, now structural), retained online=1,
+    // subscribe DBus, publish the NON-retained v2 registration. Binding completes
+    // asynchronously in STATE_WAIT_REGISTRATION.
+    if (gxClient.connect(MQTT_USER, MQTT_PASS)) {
         DEBUG_PRINTLN("MQTT connected");
-        
-        // Subscribe to DBus responses
-        mqttClient.subscribe(topicDBus.c_str());
-        DEBUG_PRINTF("Subscribed to: %s\n", topicDBus.c_str());
-        
+
         // Subscribe to command topic
         mqttClient.subscribe(topicCommand.c_str());
         DEBUG_PRINTF("Subscribed to: %s\n", topicCommand.c_str());
-        
+
         // Announce presence
-        publishLog(String("Online - ") + DEVICE_VERSION + " @ " + WiFi.localIP().toString() + 
+        publishLog(String("Online - ") + DEVICE_VERSION + " @ " + WiFi.localIP().toString() +
                    " OTA: http://" + WiFi.localIP().toString() + ":" + String(HTTP_OTA_PORT) + "/update");
-        
+
         return true;
     } else {
         DEBUG_PRINTF("MQTT connect failed, rc=%d\n", mqttClient.state());
@@ -955,7 +962,11 @@ bool mqttConnect() {
     }
 }
 
-void mqttCallback(char* topic, byte* payload, unsigned int length) {
+// Non-contract messages, forwarded from the lib's NotOurs path: our Command topic and
+// the genset N/ subscriptions. Contract traffic (DBus binding, online self-heal,
+// cookie re-announce, rebind detection) is consumed inside GxClient.
+void onProjectMessage(const char* topic, const uint8_t* payload, size_t length, void* ctx) {
+    (void)ctx;
     char buffer[1024];
     if (length >= sizeof(buffer)) {
         DEBUG_PRINTLN("MQTT payload too large");
@@ -963,9 +974,9 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     }
     memcpy(buffer, payload, length);
     buffer[length] = '\0';
-    
+
     DEBUG_PRINTF("MQTT received [%s]: %s\n", topic, buffer);
-    
+
     // Check if this is a command
     if (String(topic) == topicCommand) {
         handleCommand(buffer);
@@ -979,102 +990,24 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         int inst = parseGensetTopic(topic, &rest);
         if (inst >= 0) {
             handleGensetMessage(inst, rest, buffer);
-            return;
         }
     }
 #endif
+}
 
-    // Check if this is a DBus response
-    if (String(topic) != topicDBus) {
-        return;
-    }
-    
-    // Parse registration response
-    JsonDocument doc;
-    DeserializationError error = deserializeJson(doc, buffer);
-    
-    if (error) {
-        DEBUG_PRINTF("JSON parse error: %s\n", error.c_str());
-        return;
-    }
-    
-    // Extract portalId
-    if (doc["portalId"].is<const char*>()) {
-        strlcpy(portalId, doc["portalId"] | "", sizeof(portalId));
-        DEBUG_PRINTF("Portal ID: %s\n", portalId);
-    }
-    
-    // Extract device instances and topic paths for each virtual meter
-    JsonObject deviceInstances = doc["deviceInstance"];
-    JsonObject topicPaths = doc["topicPath"];
-    
-    for (int i = 0; i < METER_COUNT; i++) {
-        const char* serviceId = virtualMeters[i].serviceId;
-        
-        if (deviceInstances[serviceId].is<int>()) {
-            meterStates[i].deviceInstance = deviceInstances[serviceId];
-            DEBUG_PRINTF("Meter %s instance: %d\n", serviceId, meterStates[i].deviceInstance);
-        }
-        
-        if (topicPaths[serviceId].is<JsonObject>()) {
-            JsonObject paths = topicPaths[serviceId];
-            if (paths["W"].is<const char*>()) {
-                strlcpy(meterStates[i].topicPath, paths["W"] | "", sizeof(meterStates[i].topicPath));
-                meterStates[i].registered = true;
-                DEBUG_PRINTF("Meter %s topic: %s\n", serviceId, meterStates[i].topicPath);
-            }
-        }
-    }
-    
-    // Check if all meters registered
-    allMetersRegistered = true;
-    for (int i = 0; i < METER_COUNT; i++) {
-        if (!meterStates[i].registered) {
-            allMetersRegistered = false;
-            break;
-        }
-    }
-    
-    if (allMetersRegistered) {
-        DEBUG_PRINTLN("All meters registered successfully");
-        publishLog("All meters registered");
-    }
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+    gxClient.handleMessage(topic, payload, length);
 }
 
 // ============================================================================
 // Registration Functions
 // ============================================================================
 
-void sendRegistration() {
-    JsonDocument doc;
-    
-    doc["clientId"] = CLIENT_ID;
-    doc["connected"] = 1;
-    doc["version"] = DEVICE_VERSION;
-    
-    JsonObject services = doc["services"].to<JsonObject>();
-    for (int i = 0; i < METER_COUNT; i++) {
-        services[virtualMeters[i].serviceId] = "grid";
-    }
-    
-    char payload[512];
-    serializeJson(doc, payload, sizeof(payload));
-    
-    DEBUG_PRINTF("Publishing registration to %s: %s\n", topicStatus.c_str(), payload);
-    mqttClient.publish(topicStatus.c_str(), payload, true);
-}
-
+// Reset per-connection genset tracking; the projector session itself resets inside
+// gxClient.connect(). Re-learn instance/AC capability on the next connection (both
+// are re-asserted by the republish after we re-subscribe).
 void clearRegistration() {
-    portalId[0] = '\0';
-    allMetersRegistered = false;
-    for (int i = 0; i < METER_COUNT; i++) {
-        meterStates[i].registered = false;
-        meterStates[i].topicPath[0] = '\0';
-        meterStates[i].deviceInstance = 0;
-    }
 #if ENABLE_GENSET_HANDOFF
-    // Re-bind + re-learn the genset on the next connection (instances/AC capability
-    // are re-asserted by the republish after we re-subscribe).
     gensetSubscribed = false;
     gensetInstance = -1;
     gensetRunning = false;
@@ -1104,11 +1037,6 @@ bool isPhaseValid(int physicalPhase) {
 // to the grid meter).
 void publishVirtualMeter(int meterIndex, bool forceZero) {
     VirtualMeterConfig const& meter = virtualMeters[meterIndex];
-    VirtualMeterState& state = meterStates[meterIndex];
-
-    if (!state.registered || state.topicPath[0] == '\0') {
-        return;
-    }
 
     if (!forceZero) {
         // Check if at least one mapped phase has valid data
@@ -1122,16 +1050,12 @@ void publishVirtualMeter(int meterIndex, bool forceZero) {
         if (!hasValidData) return;
     }
 
+    // {"topicPath":"W/<portal>/grid/<inst>","values":{...}} — null when not bound.
+    // Identity (ProductId/CustomName/DeviceType/ErrorCode) rides the registration
+    // init now, not every 500ms cycle.
     JsonDocument doc;
-    doc["topicPath"] = state.topicPath;
-
-    JsonObject values = doc["values"].to<JsonObject>();
-
-    // Metadata
-    values["ProductId"] = 0xFFFF;
-    values["CustomName"] = meter.name;
-    values["DeviceType"] = meter.deviceType;
-    values["ErrorCode"] = 0;
+    JsonObject values = gxSession.proxyValues(doc, meter.serviceId);
+    if (values.isNull()) return;
 
     // Aggregates
     float totalPower = 0;
@@ -1176,13 +1100,7 @@ void publishVirtualMeter(int meterIndex, bool forceZero) {
         values["Ac/Energy/Reverse"] = totalEnergyRev;
     }
 
-    char payload[1024];
-    serializeJson(doc, payload, sizeof(payload));
-
-    char topic[64];
-    snprintf(topic, sizeof(topic), "device/%s/Proxy", CLIENT_ID);
-
-    mqttClient.publish(topic, payload);
+    gxClient.publishProxy(doc);     // streamed to device/<id>/Proxy, non-retained
 }
 
 void publishAllMeters() {
@@ -1255,46 +1173,54 @@ void runStateMachine() {
             }
             
             if (mqttConnect()) {
-                changeState(STATE_REGISTER);
+                // gxClient.connect() already published the registration; wait for
+                // the async DBus binding.
+                changeState(STATE_WAIT_REGISTRATION);
             } else if (stateTime > MQTT_CONNECT_TIMEOUT_MS) {
                 DEBUG_PRINTLN("MQTT timeout, retrying...");
                 stateEnteredTime = now;
             }
             break;
-            
-        case STATE_REGISTER:
-            if (!mqttClient.connected()) {
-                changeState(STATE_MQTT_CONNECT);
-                break;
-            }
-            
-            sendRegistration();
-            changeState(STATE_WAIT_REGISTRATION);
-            break;
-            
+
         case STATE_WAIT_REGISTRATION:
             if (!mqttClient.connected()) {
                 clearRegistration();
                 changeState(STATE_MQTT_CONNECT);
                 break;
             }
-            
-            if (allMetersRegistered) {
+
+            if (gxSession.bound()) {
+                DEBUG_PRINTLN("All meters registered successfully");
+                publishLog("All meters registered");
                 changeState(STATE_RUNNING);
                 lastPublishTime = 0;    // Force immediate publish
             } else if (stateTime > REGISTRATION_TIMEOUT_MS) {
-                DEBUG_PRINTLN("Registration timeout, retrying...");
-                changeState(STATE_REGISTER);
+                // Registration and binding are per-connection: retry means redoing
+                // the whole handshake on a fresh connection.
+                DEBUG_PRINTLN("Registration timeout, reconnecting...");
+                mqttClient.disconnect();
+                clearRegistration();
+                changeState(STATE_MQTT_CONNECT);
             }
             break;
-            
+
         case STATE_RUNNING:
             if (!wifiIsConnected()) {
                 changeState(STATE_WIFI_CONNECT);
                 break;
             }
-            
+
             if (!mqttClient.connected()) {
+                clearRegistration();
+                changeState(STATE_MQTT_CONNECT);
+                break;
+            }
+
+            if (gxClient.needsRebind()) {
+                // A re-announce reply carried different instances: our topic bases
+                // are stale. Reconnect to rebind cleanly (connect() clears the flag).
+                DEBUG_PRINTLN("Instance rebind required, reconnecting...");
+                mqttClient.disconnect();
                 clearRegistration();
                 changeState(STATE_MQTT_CONNECT);
                 break;
@@ -1356,12 +1282,11 @@ void setup() {
     for (int i = 0; i < 3; i++) {
         meterData.phases[i].valid = false;
     }
-    for (int i = 0; i < METER_COUNT; i++) {
-        meterStates[i].registered = false;
-        meterStates[i].topicPath[0] = '\0';
-        meterStates[i].deviceInstance = 0;
-    }
-    
+
+    // Projector contract wiring: init values per meter + non-contract dispatch
+    gxClient.setInitFiller(fillMeterInit, nullptr);
+    gxClient.setMessageHandler(onProjectMessage, nullptr);
+
     ledSetup();
     wifiSetup();
     mqttSetup();
