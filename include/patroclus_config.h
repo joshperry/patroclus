@@ -1,8 +1,17 @@
-#ifndef CONFIG_H
-#define CONFIG_H
+#ifndef PATROCLUS_CONFIG_H
+#define PATROCLUS_CONFIG_H
 #if __has_include("secrets.h")
 #include "secrets.h"
 #endif
+
+// ============================================================================
+// Shared configuration.
+//
+// This header holds only cross-instance concerns: hardware pins, the CAN protocol,
+// networking, timing, and feature toggles. Per-instance identity and the physical->
+// virtual meter mapping are composed by each app (src/apps/<name>/app.cpp) through the
+// Runtime API - see lib/PatroclusRuntime.
+// ============================================================================
 
 // ============================================================================
 // WiFi Configuration
@@ -34,8 +43,11 @@
 // ============================================================================
 // Device Identity
 // ============================================================================
-#define CLIENT_ID "patroclus01"
-#define DEVICE_VERSION "v0.6.2"
+// The client id (MQTT client / mDNS host / OTA target / topic prefix) is set per
+// instance by the app via Runtime::setIdentity(); this is only the fallback for an
+// app that never calls it.
+#define CLIENT_ID_DEFAULT "patroclus"
+#define DEVICE_VERSION "v0.7.0"
 
 // ============================================================================
 // HTTP OTA Configuration
@@ -47,10 +59,17 @@
 // CAN / TWAI Configuration
 // ============================================================================
 
-// Pin assignments (XIAO ESP32-S3)
-// Use D0/D1 to avoid boot ROM UART spew on GPIO43/44
-#define CAN_RX_PIN GPIO_NUM_44   // D1 - connects to meter TXD
-#define CAN_TX_PIN GPIO_NUM_43   // D0 - for active mode ACK
+// Pin assignments (XIAO ESP32-S3). CAN sits on D0/D1 (GPIO1/GPIO2), matching the
+// single-wire tap in the README. Deliberately NOT the TX/RX header pins (GPIO43/44,
+// silkscreen D6/D7): those are UART0, so the boot-ROM console + IDF error logging fight
+// the CAN line and hang the TWAI driver (interrupt-WDT panic) on a busy bus.
+// Overridable via -D build flags for a board wired differently.
+#ifndef CAN_RX_PIN
+#define CAN_RX_PIN GPIO_NUM_2    // D1 - reads the shared bus (RX, bus-direct)
+#endif
+#ifndef CAN_TX_PIN
+#define CAN_TX_PIN GPIO_NUM_1    // D0 - drives the bus through its diode (active-mode ACK)
+#endif
 
 // CAN bus speed - VE.CAN uses 250 kbps
 #define CAN_BITRATE 250000
@@ -91,76 +110,9 @@
 #define REG_L3_PF            0x09    // L3 Power Factor × 1000
 
 // ============================================================================
-// Virtual Meter Configuration
-// ============================================================================
-// Maps physical meter phases to virtual meters published to Venus OS
-//
-// Physical phases from MV-3P75CT: L1, L2, L3 (indices 0, 1, 2)
-// Each virtual meter can have 1-3 phases mapped from physical phases
-//
-// Example: Split-phase shore + single-phase inverter input
-//   Meter 0 "Shore Power":    Physical L1 → Virtual L1, Physical L2 → Virtual L2
-//   Meter 1 "Inverter Input": Physical L3 → Virtual L1
-
-#define METER_COUNT 2
-
-// --- Meter 0: Shore Power (2-phase) ---
-#define METER0_SERVICE_ID    "grid_shore"
-#define METER0_NAME          "Shore Power"
-#define METER0_DEVICE_TYPE   "grid"
-#define METER0_PHASE_COUNT   2
-// Physical phase index for each virtual phase (-1 = not used)
-#define METER0_VIRT_L1_PHYS  0    // Physical L1 → Virtual L1
-#define METER0_VIRT_L2_PHYS  1    // Physical L2 → Virtual L2
-#define METER0_VIRT_L3_PHYS  -1   // Not used
-
-// --- Meter 1: Inverter Input (single-phase) ---
-#define METER1_SERVICE_ID    "grid_inverter"
-#define METER1_NAME          "Inverter Input"
-#define METER1_DEVICE_TYPE   "acload"
-#define METER1_PHASE_COUNT   1
-#define METER1_VIRT_L1_PHYS  2    // Physical L3 → Virtual L1
-#define METER1_VIRT_L2_PHYS  -1   // Not used
-#define METER1_VIRT_L3_PHYS  -1   // Not used
-
-// ============================================================================
-// Generator Handoff (transfer-switched inlet meter -> genset output)
-// ============================================================================
-// When a generator runs, the AC transfer switch routes its output through the same
-// inlet a "grid" meter measures, so that meter now reads the GENERATOR's output.
-// Reporting it on BOTH the grid meter AND a genset service double-counts it in Venus
-// systemcalc (Consumption = grid + genset). With handoff enabled, while a generator
-// is running we move that meter's readings to the genset's AC paths and zero the grid
-// meter, so exactly one service reports the power.
-//
-// Deliberately GENERIC - watches any Venus genset's /StatusCode, no dependency on a
-// particular controller. Degrades safely: with no genset present, or a genset that
-// has no writable AC paths, the inlet meter just keeps reporting as grid (the power
-// is still counted once - never dropped).
-#ifndef ENABLE_GENSET_HANDOFF
-#define ENABLE_GENSET_HANDOFF 1
-#endif
-
-// Virtual-meter index that sits AFTER the transfer switch (the shared inlet).
-#define GENSET_HANDOFF_METER        0
-
-// Genset device instance to follow, or -1 to track whichever genset is running.
-#define GENSET_INSTANCE             -1
-
-// /StatusCode value meaning "running / producing AC" (Venus genset: 8 = Running).
-#define GENSET_RUNNING_STATUSCODE   8
-
-// Keepalive cadence that keeps the GX pushing N/ genset topics to us (< ~60s cutoff).
-#define GENSET_KEEPALIVE_MS         25000
-
-// Every Nth keepalive triggers a full republish (re-learn genset presence / AC
-// capability for a genset that appeared after we connected). First one always does.
-#define GENSET_REPUBLISH_EVERY      10
-
-// ============================================================================
 // Timing Configuration (milliseconds)
 // ============================================================================
-#define PUBLISH_INTERVAL_MS     500        // Publish to MQTT every 1 second
+#define PUBLISH_INTERVAL_MS     500        // Publish to MQTT every 500 ms
 #define HEARTBEAT_INTERVAL_MS   60000       // Keepalive every 60 seconds
 #define CAN_TIMEOUT_MS          5000        // No CAN data = stale
 
@@ -193,4 +145,17 @@
 
 #define SERIAL_BAUD 115200
 
-#endif // CONFIG_H
+// ============================================================================
+// Debug Logging
+// ============================================================================
+#if ENABLE_SERIAL_DEBUG
+    #define DEBUG_PRINT(x) Serial.print(x)
+    #define DEBUG_PRINTLN(x) Serial.println(x)
+    #define DEBUG_PRINTF(...) Serial.printf(__VA_ARGS__)
+#else
+    #define DEBUG_PRINT(x)
+    #define DEBUG_PRINTLN(x)
+    #define DEBUG_PRINTF(...)
+#endif
+
+#endif // PATROCLUS_CONFIG_H

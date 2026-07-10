@@ -183,7 +183,9 @@ Power sign: Negative = importing (consuming), Positive = exporting. Ensure your 
 
 ## Configuration
 
-Edit `include/config.h` to change features, timings, and mappings.
+Edit `include/patroclus_config.h` for shared hardware/network settings, features, and
+timings. The per-board identity and physical→virtual meter mapping live in each app
+(see [Instances](#instances-apps)), not here.
 
 Add your secret config vars to `include/secrets.h`, it is excluded by `.gitignore`.
 
@@ -201,58 +203,75 @@ Add your secret config vars to `include/secrets.h`, it is excluded by `.gitignor
 #define MQTT_PASS "1234567"
 ```
 
-### Virtual Meter Mapping
+## Instances (apps)
 
-Map physical meter phases to virtual meters published to Venus OS:
+One codebase flashes multiple physically-distinct boards. The generic firmware —
+CAN decode, WiFi, MQTT, the gx-projector contract, the publish loop, OTA, LED, and
+commands — lives in `lib/PatroclusRuntime`. Each board is a thin **app** under
+`src/apps/<name>/app.cpp` that names its identity and composes its physical→virtual
+meter mapping through the runtime API, then drives it. The build env selects which app
+compiles (`build_src_filter` in `platformio.ini`), mirroring the composition split used
+by the sibling switchy/hypnos projects.
 
-```c
-#define METER_COUNT 2
+| App (`-e`) | Client id | Board meter CTs | Virtual meters |
+|------------|-----------|-----------------|----------------|
+| `split_phase` | `patroclus01` | L1 + L2 legs of the transfer-switch input | `grid_shore` (2-phase `grid`) |
+| `inverter` | `patroclus02` | inverter input conductor + output bus | `inv_input` (`grid`), `inv_output` (`acload`) |
 
-// Shore Power: 2-phase (physical L1+L2)
-#define METER0_SERVICE_ID    "grid_shore"
-#define METER0_NAME          "Shore Power"
-#define METER0_PHASE_COUNT   2
-#define METER0_VIRT_L1_PHYS  0    // Physical L1 → Virtual L1
-#define METER0_VIRT_L2_PHYS  1    // Physical L2 → Virtual L2
-#define METER0_VIRT_L3_PHYS  -1   // Not used
+An app composes meters like this (`src/apps/split_phase/app.cpp`):
 
-// Inverter Input: 1-phase (physical L3)
-#define METER1_SERVICE_ID    "grid_inverter"
-#define METER1_NAME          "Inverter Input"
-#define METER1_PHASE_COUNT   1
-#define METER1_VIRT_L1_PHYS  2    // Physical L3 → Virtual L1
-#define METER1_VIRT_L2_PHYS  -1
-#define METER1_VIRT_L3_PHYS  -1
+```cpp
+#include "Runtime.h"
+using namespace patroclus;
+static Runtime rt;
+
+void setup() {
+    rt.setIdentity("patroclus01");
+    rt.addMeter("grid_shore", "Shore Power", "grid")
+        .mapPhase(0, 0)   // virtual L1 <- physical CT 0
+        .mapPhase(1, 1);  // virtual L2 <- physical CT 1
+    rt.begin();
+}
+void loop() { rt.loop(); }
 ```
+
+`mapPhase(virtualLeg, physicalCt)` is the direct-copy case. For derived/composite
+values (e.g. subtracting an inverter's charge draw for correct GX accounting), a meter
+can instead take a computed projection via `setProjection(fn)` — see the plan's
+accounting notes and `lib/PatroclusRuntime/src/VirtualMeter.h`.
+
+To add a board: drop a new `src/apps/<name>/app.cpp` and a matching `[env:<name>]` in
+`platformio.ini`.
 
 ## Building
 
 Requires PlatformIO.
 
 ```bash
-# With Nix
-nix develop
-pio run
+nix develop                 # dev shell with platformio
+pio run -e split_phase      # build patroclus01
+pio run -e inverter         # build patroclus02
 ```
 
 ### Upload
 
 **USB (initial flash):**
 ```bash
-pio run -t upload
+pio run -e split_phase -t upload      # or -e inverter
 ```
 
 **HTTP OTA (remote):**
 ```bash
-pio run -e ota -t upload
+pio run -e split_phase_ota -t upload  # POSTs to patroclus01.local:8080
+pio run -e inverter_ota -t upload     # POSTs to patroclus02.local:8080
 ```
 
 **Manual OTA:**
 ```bash
-curl -X POST -F "firmware=@.pio/build/xiao_esp32s3/firmware.bin" http://patroclus.local:8080/update
+curl -X POST -F "firmware=@.pio/build/split_phase/firmware.bin" http://patroclus01.local:8080/update
 ```
 
-Or open `http://patroclus.local:8080/` in a browser for the upload form.
+Or open `http://patroclus01.local:8080/` in a browser for the upload form.
 
 ## MQTT Interface
 
